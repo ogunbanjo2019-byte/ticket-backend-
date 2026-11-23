@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { handleApi } from './ticket-service.js';
+
 const port = Number(process.env.PORT || 3000);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*').split(',').map((origin) => origin.trim());
 function cors(req, res) {
@@ -9,7 +10,7 @@ function cors(req, res) {
   if (allowed) res.setHeader('Access-Control-Allow-Origin', allowedOrigins.includes('*') ? '*' : origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   return allowed;
 }
 function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
@@ -18,20 +19,39 @@ function log(level, requestId, method, pathname, status, message = '') {
   if (message) entry.message = message;
   console[level === 'error' ? 'error' : 'log'](JSON.stringify(entry));
 }
+function boundedParam(params, source, target, requestUrl, max = 100) {
+  const value = (requestUrl.searchParams.get(source) || '').trim().slice(0, max);
+  if (value) params.set(target, value);
+}
 async function handleLiveEvents(req, res) {
   const apiKey = process.env.TM_API_KEY;
   if (!apiKey) { json(res, 200, { configured: false, events: [], message: 'Provider event discovery is not configured.' }); return true; }
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-  const params = new URLSearchParams({ apikey: apiKey, countryCode: requestUrl.searchParams.get('countryCode') || 'US', size: requestUrl.searchParams.get('size') || '24', sort: 'date,asc' });
-  for (const key of ['keyword', 'city', 'classificationName', 'dmaId']) { const value = requestUrl.searchParams.get(key); if (value) params.set(key, value); }
+  const countryCode = (requestUrl.searchParams.get('countryCode') || 'US').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2) || 'US';
+  const requestedSize = Number(requestUrl.searchParams.get('size') || 24);
+  const params = new URLSearchParams({ apikey: apiKey, countryCode, size: String(Math.max(1, Math.min(50, Number.isFinite(requestedSize) ? requestedSize : 24))), sort: 'date,asc' });
+  boundedParam(params, 'keyword', 'keyword', requestUrl, 120);
+  boundedParam(params, 'city', 'city', requestUrl, 80);
+  boundedParam(params, 'classificationName', 'classificationName', requestUrl, 80);
+  boundedParam(params, 'dmaId', 'dmaId', requestUrl, 30);
   try {
     const upstream = await fetch(`https://app.ticketmaster.com/discovery/v2/events.json?${params}`);
     const payload = await upstream.json();
     if (!upstream.ok) { json(res, upstream.status, { error: payload?.fault?.faultstring || 'Live event request failed.' }); return true; }
-    json(res, 200, { configured: true, events: payload?._embedded?.events || [], page: payload?.page || null });
+    json(res, 200, { configured: true, events: payload?._embedded?.events || [], page: payload?.page || null, source: 'Ticketmaster Discovery API', inventoryMode: 'event-discovery-only' });
   } catch { json(res, 502, { error: 'Unable to reach the live event provider.' }); }
   return true;
 }
+function providerStatus() {
+  return {
+    eventDiscovery: { configured: Boolean(process.env.TM_API_KEY), provider: 'Ticketmaster Discovery API' },
+    partnerInventory: { credentialsConfigured: Boolean(process.env.TM_PARTNER_API_KEY), apiFlowIntegrated: false, accessApprovalRequired: true, active: false },
+    checkoutAndReservations: { integrated: false, active: false },
+    entryValidation: { integrated: false, active: false },
+    note: 'Credentials alone do not grant access. Partner APIs require provider approval, agreements, and an implemented authorized transaction flow.'
+  };
+}
+
 createServer(async (req, res) => {
   const requestId = randomUUID();
   const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
@@ -43,6 +63,7 @@ createServer(async (req, res) => {
   if (!cors(req, res)) return json(res, 403, { error: 'Origin is not allowed. Configure ALLOWED_ORIGINS on the backend.', requestId });
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   if (pathname === '/api/health' && req.method === 'GET') return json(res, 200, { ok: true, service: 'ticketly-api' });
+  if (pathname === '/api/provider-status' && req.method === 'GET') return json(res, 200, providerStatus());
   if (pathname === '/api/live-events' && req.method === 'GET') return handleLiveEvents(req, res);
   if (pathname.startsWith('/api/')) {
     try { const handled = await handleApi(req, res, pathname); if (handled) return; }
